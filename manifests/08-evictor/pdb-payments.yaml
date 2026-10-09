@@ -1,0 +1,10 @@
+# Module 08: blocks every payments eviction.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments
+  namespace: shop
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: payments }

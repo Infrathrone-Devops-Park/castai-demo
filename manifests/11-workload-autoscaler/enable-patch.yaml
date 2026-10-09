@@ -1,0 +1,9 @@
+# Merge patch: opt one Deployment in.
+# Pins policy, turns vertical on.
+# Template untouched: no rollout.
+metadata:
+  annotations:
+    workloads.cast.ai/configuration: |
+      scalingPolicyName: shop-rightsizing
+      vertical:
+        optimization: on

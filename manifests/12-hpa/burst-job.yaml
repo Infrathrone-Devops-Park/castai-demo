@@ -1,0 +1,41 @@
+# One 4-minute burst on recommender.
+# ~6 x 200m concurrent, then exits.
+# HPA caps at 5 pods (quota).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: burst
+  namespace: shop
+  labels: { app: burst, app.kubernetes.io/part-of: shop-demo }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 420
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: burst }
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: curl
+          image: curlimages/curl:8.21.0
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              U=http://recommender.shop.svc:8080/ConsumeCPU
+              i=0
+              while [ "$i" -lt 24 ]; do
+                n=0
+                while [ "$n" -lt 6 ]; do
+                  curl -s -m 5 -X POST "$U?millicores=200&durationSec=10" >/dev/null || true
+                  n=$((n+1))
+                done
+                echo "$(date -u +%T) sent 6x200m"
+                sleep 10
+                i=$((i+1))
+              done
+              echo done

@@ -1,0 +1,36 @@
+# Module 09: direct template selector.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: castai-lab
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch
+  namespace: castai-lab
+  labels: { app: batch }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: batch } }
+  template:
+    metadata:
+      labels: { app: batch }
+    spec:
+      terminationGracePeriodSeconds: 5
+      nodeSelector:
+        scheduling.cast.ai/node-template: batch
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: batch
+          effect: NoSchedule
+        # spot-safe after the flip
+        - key: scheduling.cast.ai/spot
+          operator: Exists
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: { cpu: 500m, memory: 128Mi }
+            limits: { memory: 128Mi }

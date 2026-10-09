@@ -1,0 +1,157 @@
+# "shop": over-provisioned demo app.
+# Requests 6.0 vCPU, uses ~1.6.
+# stress-ng: constant --cpu-load, fixed memory.
+# No PDBs: drains never block.
+# No capacity-type selectors: both autoscalers schedule.
+#
+# deploy   rep  req/pod  use/pod   req    use
+# frontend  3   400m     ~100m    1200m   300m
+# cart      2   300m     ~70m      600m   140m
+# catalog   2   500m     ~120m    1000m   240m
+# checkout  2   500m     ~100m    1000m   200m
+# payments  2   400m     ~100m     800m   200m
+# worker    2   700m     ~250m    1400m   500m
+# total    13                     6000m  1580m
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: shop
+  labels: { app: frontend, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: frontend } }
+  template:
+    metadata:
+      labels: { app: frontend, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          # pinned digest, built 2026-09-14
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 10% of one core
+          args: ["--cpu", "1", "--cpu-load", "10", "--vm", "1", "--vm-bytes", "64M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 400m, memory: 256Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: shop
+  labels: { app: cart, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: cart } }
+  template:
+    metadata:
+      labels: { app: cart, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 7% of one core
+          args: ["--cpu", "1", "--cpu-load", "7", "--vm", "1", "--vm-bytes", "64M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 300m, memory: 256Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: shop
+  labels: { app: catalog, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: catalog } }
+  template:
+    metadata:
+      labels: { app: catalog, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 12% of one core
+          args: ["--cpu", "1", "--cpu-load", "12", "--vm", "1", "--vm-bytes", "128M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 500m, memory: 384Mi }
+            limits: { memory: 768Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: shop
+  labels: { app: checkout, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: checkout } }
+  template:
+    metadata:
+      labels: { app: checkout, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 10% of one core
+          args: ["--cpu", "1", "--cpu-load", "10", "--vm", "1", "--vm-bytes", "64M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 500m, memory: 256Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments
+  namespace: shop
+  labels: { app: payments, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: payments } }
+  template:
+    metadata:
+      labels: { app: payments, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 10% of one core
+          args: ["--cpu", "1", "--cpu-load", "10", "--vm", "1", "--vm-bytes", "64M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 400m, memory: 256Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: shop
+  labels: { app: worker, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: worker } }
+  template:
+    metadata:
+      labels: { app: worker, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: colinianking/stress-ng:3e6ae045c5ff4c409282f7e8f54812c732ab7828@sha256:050846da751de675e62869ea7bcc21c113feaa224e56aed5feb9c8f5ff04e22d
+          # 25% of one core
+          args: ["--cpu", "1", "--cpu-load", "25", "--vm", "1", "--vm-bytes", "192M", "--vm-hang", "0", "--timeout", "0"]
+          resources:
+            requests: { cpu: 700m, memory: 512Mi }
+            limits: { memory: 1Gi }

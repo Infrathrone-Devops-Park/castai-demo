@@ -1,0 +1,31 @@
+# Headroom pattern (V2 has no headroom).
+# Dry-run only in module 07.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: castai-lab-headroom
+value: -10
+preemptionPolicy: Never
+globalDefault: false
+description: "Placeholder pods, evicted first"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headroom
+  namespace: castai-lab
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: headroom } }
+  template:
+    metadata:
+      labels: { app: headroom }
+    spec:
+      priorityClassName: castai-lab-headroom
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          # reserves one spare vCPU
+          resources:
+            requests: { cpu: "1", memory: 256Mi }

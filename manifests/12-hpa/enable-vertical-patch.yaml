@@ -1,0 +1,10 @@
+# Merge patch for recommender (has HPA).
+# Vertical on + HPA converter.
+metadata:
+  annotations:
+    workloads.cast.ai/configuration: |
+      scalingPolicyName: shop-rightsizing
+      vertical:
+        optimization: on
+        hpaConverters:
+          - type: AverageValueFromOriginalRequests

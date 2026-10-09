@@ -1,0 +1,101 @@
+# Module 12: spiky HPA service.
+# Requires shop namespace (workloads/shop.yaml).
+# 12-minute cycle: 6 quiet, 6 burst.
+# Quiet ~200m total, burst ~1200m total.
+# Requests: 2-5 x 200m, loadgen 20m.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommender
+  namespace: shop
+  labels: { app: recommender, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: recommender } }
+  template:
+    metadata:
+      labels: { app: recommender, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          # burns CPU per HTTP request
+          image: registry.k8s.io/e2e-test-images/resource-consumer:1.15.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 200m, memory: 128Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recommender
+  namespace: shop
+spec:
+  selector: { app: recommender }
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: recommender
+  namespace: shop
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: recommender
+  minReplicas: 2
+  # quota guard
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    # fast scale-down for demo
+    scaleDown:
+      stabilizationWindowSeconds: 60
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen
+  namespace: shop
+  labels: { app: loadgen, app.kubernetes.io/part-of: shop }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: loadgen } }
+  template:
+    metadata:
+      labels: { app: loadgen, app.kubernetes.io/part-of: shop }
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: curl
+          image: curlimages/curl:8.21.0
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+          command: ["/bin/sh", "-c"]
+          # each 10s: N x M millicores
+          args:
+            - |
+              U=http://recommender.shop.svc:8080/ConsumeCPU
+              send() {
+                n=0
+                while [ "$n" -lt "$1" ]; do
+                  curl -s -m 5 -X POST "$U?millicores=$2&durationSec=10" >/dev/null || true
+                  n=$((n+1))
+                done
+              }
+              while true; do
+                echo "$(date -u +%T) quiet"
+                i=0; while [ "$i" -lt 36 ]; do send 2 100; sleep 10; i=$((i+1)); done
+                echo "$(date -u +%T) burst"
+                i=0; while [ "$i" -lt 36 ]; do send 6 200; sleep 10; i=$((i+1)); done
+              done
