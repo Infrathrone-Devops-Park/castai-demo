@@ -88,7 +88,7 @@ Rules that follow from it:
 - Laptop tools: `aws` v2, `kubectl` 1.35, `helm` v4.2.3, `terraform` 1.15, `jq`, `curl`, `eks-node-viewer` (in `~/.local/bin`).
 - `../karpenter-demo` checked out next to this repo (its scripts and base manifests are reused).
 - CAST AI API key in `~/.castai/api-token` (one line, mode 600). It is never printed: `env.sh` exports it silently.
-- CAST AI org `7909c3e2-3f87-4778-a2e8-a22fa955091b` with the trial active (Node Autoscaler and Workload Autoscaler are Premium). Check Console → Organization → Billing the day before. <!-- VERIFY: exact console path for plan/trial -->
+- CAST AI org `7909c3e2-3f87-4778-a2e8-a22fa955091b` with the trial active (Node Autoscaler and Workload Autoscaler are Premium). Check the day before in Console → **Settings** → **Platform usage** (classic console: **Manage Organization** → **Platform usage**); its banner lists active subscriptions and days remaining. CAST AI's docs do not describe a trial screen, so confirm trial terms with CAST AI in writing. `scripts/castai-api.sh GET /v1/organizations/7909c3e2-3f87-4778-a2e8-a22fa955091b` returns `"billingType": "none"` for this org today (no paid subscription).
 - IAM: the `infrathrone-demo` profile can read `pricing:GetProducts` and `ec2:DescribeSpotPriceHistory` (used by `measure.sh`).
 
 ### PREP timeline (before the audience arrives)
@@ -104,7 +104,7 @@ Rules that follow from it:
 | T-30 min | Health checks (Demo below) | steps 1–6 |
 | T-30 min | Fresh price cache | `rm -f results/price-cache.json` |
 
-Why so early: the Workload Autoscaler needs at least 3 h of usage history (its minimum look-back), and the Available savings report needs the agent to have sent data for a while. Module 03 then re-runs the same `apply` live: the audience sees the plan and the security review, and Terraform reports no changes. If you prefer a truly fresh connect in module 03, you lose the 3 h history for module 11. <!-- VERIFY: does WA history accumulate in read-only mode, before workload-autoscaler is installed -->
+Why so early: the Workload Autoscaler needs at least 3 h of usage history (its minimum look-back), and the Available savings report needs the agent to have sent data for a while. Module 03 then re-runs the same `apply` live: the audience sees the plan and the security review, and Terraform reports no changes. If you prefer a truly fresh connect in module 03, you lose the 3 h history for module 11. Caveat: in read-only mode the Workload Autoscaler API answers `castai-workload-autoscaler should be installed to enable workload optimization`. Right after module 05 installs it, `shop` recommendations exist (built from agent snapshots, `origins: ["ORIGIN_SNAPSHOT"]`) but with `lowConfidence: true`. Whether read-only time counts towards the 3 h is not documented; check confidence at the start of module 11.
 
 ## Demo
 
@@ -136,7 +136,7 @@ Only Karpenter nodes plus the system node exist.
 ```bash
 kubectl get nodes -L role,karpenter.sh/nodepool,provisioner.cast.ai/managed-by,node.kubernetes.io/instance-type,karpenter.sh/capacity-type
 ```
-Expected: one node with `ROLE system` (`t3a.large`), plus 2–3 nodes with `NODEPOOL default` (2 or 4 vCPU types, mostly `spot`). The `MANAGED-BY` column is empty on every node.
+Expected: one node with `ROLE system` (`t3a.large`, empty `CAPACITY-TYPE`), plus 2–3 nodes with `NODEPOOL default` (2 or 4 vCPU types such as `c6a.xlarge`, `c8i-flex.xlarge`, mostly `spot`). The `MANAGED-BY` column is empty on every node.
 
 ### Step 4 — Karpenter active, CAST AI read-only
 Exactly one autoscaler is active.
@@ -146,7 +146,16 @@ kubectl get nodepool default -o jsonpath='{.spec.limits.cpu}{"\n"}'
 kubectl -n castai-agent get deploy,ds
 terraform -chdir=terraform output
 ```
-Expected: `karpenter 1/1`; limit `10`; in `castai-agent` the deployments `castai-agent` and `castai-agent-cpvpa` `1/1` and daemonset `castai-spot-handler` (desired = number of spot nodes); outputs `autoscaler_enabled = false`, `phase = "readonly"`, `castai_cluster_id = "<uuid>"`. <!-- VERIFY: spot-handler desired count on Karpenter spot nodes -->
+Expected: `karpenter 1/1`; limit `10`; in `castai-agent` the deployments `castai-agent` and `castai-agent-cpvpa` `1/1` and daemonset `castai-spot-handler` with `DESIRED` = number of spot nodes (its affinity matches `karpenter.sh/capacity-type=spot`, so `2` with two Karpenter spot workers). Outputs:
+```text
+autoscaler_enabled = false
+batch_template_offering = "disabled"
+castai_cluster_id = "<uuid>"
+castai_role_arn = "arn:aws:iam::146725924014:role/castai-eks-karpenter-demo"
+phase = "readonly"
+rebalancing_schedule_id = ""
+workload_scaling_policy_name = ""
+```
 
 ### Step 5 — shop has been running
 The workload has history.

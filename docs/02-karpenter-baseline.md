@@ -60,7 +60,7 @@ kubectl diff -f "$KARPENTER_DEMO_DIR/manifests/base/" && echo "BASELINE OK"
 kubectl get nodepools,ec2nodeclasses
 kubectl -n kube-system get deploy karpenter
 ```
-Expected: `BASELINE OK`; one `nodepool.karpenter.sh/default` and one `ec2nodeclass.karpenter.k8s.aws/default`, both `READY True`; `karpenter 1/1`. If `kubectl diff` prints a diff, the NodePool was changed (for example frozen at `limits.cpu: "0"`): run `kubectl apply -f "$KARPENTER_DEMO_DIR/manifests/base/"` and re-check. Do **not** run `../karpenter-demo/scripts/reset.sh` while `shop` is running: it deletes all NodeClaims and waits for zero, which never happens while `shop` pods are pending. <!-- VERIFY: kubectl diff exit 0 on server-defaulted NodePool fields -->
+Expected: `BASELINE OK`; one `nodepool.karpenter.sh/default` and one `ec2nodeclass.karpenter.k8s.aws/default`, both `READY True`; `karpenter 1/1`. If `kubectl diff` prints a diff, the NodePool was changed (for example frozen at `limits.cpu: "0"`): run `kubectl apply -f "$KARPENTER_DEMO_DIR/manifests/base/"` and re-check. Do **not** run `../karpenter-demo/scripts/reset.sh` while `shop` is running: it deletes all NodeClaims and waits for zero, which never happens while `shop` pods are pending.
 
 ### Step 3 — Deploy shop
 Already deployed in prep (≥3 h ago); the apply proves the manifests match.
@@ -68,7 +68,7 @@ Already deployed in prep (≥3 h ago); the apply proves the manifests match.
 kubectl apply -f workloads/shop.yaml
 kubectl -n shop wait deploy --all --for=condition=Available --timeout=300s
 ```
-Expected: `namespace/shop unchanged` and six `deployment.apps/<name> unchanged` lines (or `created` on a fresh cluster), then six `condition met` lines. On a fresh deploy Karpenter launches nodes in about 60–90 s.
+Expected: `namespace/shop unchanged` and six `deployment.apps/<name> unchanged` lines (or `created` on a fresh cluster), then six `condition met` lines (under 1 s when already running). On a fresh deploy Karpenter launches nodes in about 60–90 s.
 
 ### Step 4 — What Karpenter launched
 Two or three nodes, mostly spot.
@@ -76,35 +76,35 @@ Two or three nodes, mostly spot.
 kubectl get nodeclaims -o wide
 kubectl get nodes -l karpenter.sh/nodepool -L node.kubernetes.io/instance-type,karpenter.sh/capacity-type,topology.kubernetes.io/zone
 ```
-Expected: 2–3 NodeClaims, `READY True`, typically 2 × 4-vCPU types (for example `c6a.xlarge`, `c5a.xlarge`, `m6a.xlarge`) or 1 × 4-vCPU + 2 × 2-vCPU, `CAPACITY spot` on most of them. Exact types depend on spot prices at that moment. <!-- VERIFY: actual instance mix on demo day -->
+Expected: 2–3 NodeClaims, `READY True`, typically 2 × 4-vCPU types or 1 × 4-vCPU + 2 × 2-vCPU, `CAPACITY spot` on most of them. Validation run: `c6a.xlarge` (spot, ap-south-1b) and `c8i-flex.xlarge` (spot, ap-south-1c). Exact types depend on spot prices at that moment.
 
 ### Step 5 — Baseline snapshot
 The number every later module compares against.
 ```bash
 scripts/measure.sh karpenter-baseline
 ```
-Expected (shape; prices vary):
+Expected (validation run; spot prices vary):
 ```text
-NODE                                         PROVISIONER  TYPE        CAPACITY   ZONE         VCPU  USD/H
-ip-10-0-xx-xx.ap-south-1.compute.internal    karpenter    c6a.xlarge  spot       ap-south-1b  4     0.0439
-ip-10-0-xx-xx.ap-south-1.compute.internal    karpenter    m6a.xlarge  spot       ap-south-1a  4     0.0468
-ip-10-0-xx-xx.ap-south-1.compute.internal    system*      t3a.large   on-demand  ap-south-1a  2     0.0493
+NODE                                        PROVISIONER  TYPE             CAPACITY   ZONE         VCPU  USD/H
+ip-10-0-30-161.ap-south-1.compute.internal  karpenter    c6a.xlarge       spot       ap-south-1b  4     0.0519
+ip-10-0-41-192.ap-south-1.compute.internal  karpenter    c8i-flex.xlarge  spot       ap-south-1c  4     0.0528
+ip-10-0-19-127.ap-south-1.compute.internal  system*      t3a.large        on-demand  ap-south-1b  2     0.0493
 (* system node: fixed cost, not autoscaled)
 
 nodes (workers / spot workers)    3 (2 / 2)
 provisioned vCPU (all / workers)  10 / 8
-requested vCPU (all ns / shop)    7.9 / 6
-used vCPU (all ns / shop)         2.1 / 1.6
+requested vCPU (all ns / shop)    7.68 / 6
+used vCPU (all ns / shop)         1.731 / 1.590
 shop pods scheduled               13
-$/h workers                       0.0907
-$/h all nodes                     0.14
-$/h all-in (+EKS 0.10)            0.24
-$/month workers (x730)            66.21
-$/month all-in (x730)             175.2
+$/h workers                       0.1047
+$/h all nodes                     0.154
+$/h all-in (+EKS 0.10)            0.254
+$/month workers (x730)            76.43
+$/month all-in (x730)             185.42
 
 saved results/karpenter-baseline.json
 ```
-Read it out: workers ≈ 8 vCPU provisioned for 6 vCPU of shop requests and ~1.6 vCPU of shop usage. <!-- VERIFY: requested all-ns value incl. daemonsets and system pods -->
+Read it out: workers = 8 vCPU provisioned for 6 vCPU of shop requests and ~1.6 vCPU of shop usage. `requested (all ns)` adds 1.68 vCPU: system pods (karpenter, coredns, metrics-server, monitoring, castai-agent) plus daemonsets (aws-node, kube-proxy, eks-pod-identity-agent, node-exporter on every node; spot-handler on spot nodes). For reference: on-demand list price of the same types is `c6a.xlarge` $0.0935/h and `c8i-flex.xlarge` $0.178/h, so spot is 44–70% cheaper here.
 
 ### Step 6 — The gap, per node
 Full by requests, mostly idle by usage.
@@ -112,14 +112,14 @@ Full by requests, mostly idle by usage.
 kubectl describe nodes -l karpenter.sh/nodepool | grep -A4 'Allocated resources'
 kubectl top nodes -l karpenter.sh/nodepool
 ```
-Expected: `cpu` requests around 75–95% of allocatable on each Karpenter node; `kubectl top` `CPU%` around 20–30%.
+Expected: `cpu` requests between ~60% and ~99% of allocatable per Karpenter node (validation run: `3880m (98%)` and `2480m (63%)`); `kubectl top` `CPU%` around 20–25%.
 
 ### Step 7 — eks-node-viewer
 The neutral price view both camps already use.
 ```bash
 eks-node-viewer --resources cpu --extra-labels karpenter.sh/nodepool,node.kubernetes.io/instance-type,karpenter.sh/capacity-type
 ```
-Expected: one bar per node filled to roughly the request percentage, a `$/hour` per node, and a total line `N nodes (... /...) ... $X/hour | $Y/month`. Its prices come from the same AWS APIs; small differences from `measure.sh` are rounding or spot refresh timing. Press `q` to quit.
+Expected: one bar per node filled to roughly the request percentage, a `$/hour` per node, and a total line such as `3 nodes (7680m/9770m) 78.6% cpu ... $0.154/hour | $112.420/month`. The total includes the system node, so compare it with `$/h all nodes` from `measure.sh` (validation run: both `0.154`). The first frame can show a higher figure (`$0.180/hour`) until live spot prices load. Press `q` to quit.
 
 ### Step 8 — Try to beat it by hand (optional)
 Karpenter has nothing left to consolidate.

@@ -85,7 +85,7 @@ The scheduler sees the left column; the bill follows it.
 kubectl -n shop get pods -o 'custom-columns=POD:.metadata.name,CPU_REQ:.spec.containers[0].resources.requests.cpu,MEM_REQ:.spec.containers[0].resources.requests.memory'
 kubectl -n shop top pods
 ```
-Expected: 13 pods. Requests `400m` (frontend), `300m` (cart), `500m` (catalog, checkout), `400m` (payments), `700m` (worker). Usage around `100m`, `70m`, `120m`, `100m`, `100m`, `250m` respectively, and memory usage 70–200 Mi against 256–512 Mi requested. <!-- VERIFY: stress-ng --cpu-load accuracy within ±15m -->
+Expected: 13 pods. Requests `400m` (frontend), `300m` (cart), `500m` (catalog, checkout), `400m` (payments), `700m` (worker). Usage `100m`–`103m`, `71m`, `119m`–`122m`, `100m`–`101m`, `101m`, `250m` respectively (stress-ng holds within ±5m), and memory usage 67–195 Mi against 256–512 Mi requested.
 
 ### Step 3 — The total gap
 One number for the whiteboard.
@@ -93,7 +93,7 @@ One number for the whiteboard.
 kubectl -n shop get pods -o json | jq '[.items[].spec.containers[].resources.requests.cpu | rtrimstr("m") | tonumber] | add / 1000'
 kubectl -n shop top pods --sum --no-headers | tail -1
 ```
-Expected: `6` (vCPU requested) and a sum line around `1600m` (vCPU used). Roughly 26% of what is reserved is used. <!-- VERIFY: kubectl 1.35 top --sum output shape -->
+Expected: `6` (vCPU requested) and an indented sum line with no name, for example `                            1582m      1258Mi` (vCPU and memory used). Roughly 26% of what is reserved is used.
 
 ### Step 4 — Node view
 How the requests fill nodes.
@@ -101,7 +101,7 @@ How the requests fill nodes.
 kubectl get nodes -l karpenter.sh/nodepool -o 'custom-columns=NODE:.metadata.name,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,CAP:.metadata.labels.karpenter\.sh/capacity-type,CPU:.status.capacity.cpu'
 kubectl top nodes
 ```
-Expected: 2–3 Karpenter nodes totalling 8–10 vCPU, `CPU%` in `kubectl top nodes` around 20–30% on each worker, even though by requests they are nearly full.
+Expected: 2–3 Karpenter nodes totalling 8–10 vCPU (validation run: `c6a.xlarge` + `c8i-flex.xlarge`, both `spot`, 4 vCPU each). In `kubectl top nodes` the workers sit around 20–25% `CPU%` (system node ~8%), even though by requests they are nearly full.
 
 ## Talking points
 - "Karpenter is doing its job perfectly here. It packed 6 vCPU of requests onto as few, cheap nodes as it could. The problem is that 6 vCPU of requests describes 1.6 vCPU of work."

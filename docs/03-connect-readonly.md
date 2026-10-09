@@ -55,7 +55,9 @@ Be precise here: "read-only" describes the **in-cluster** agent. The Terraform r
 | `castai_autoscaler_policies`, `castai_evictor` | Created with `enabled = false` |
 | `helm_release.castai` | `tags.readonly=true`: only the agent and spot handler |
 
-Nothing provisions nodes in this phase: the autoscaler policy is off and no cluster-controller is installed to execute actions. A strictly read-only connect (no IAM role at all) is possible with only `castai_eks_cluster` (no `assume_role_arn`) plus the agent; we pre-create IAM so phase 2 is one variable away. <!-- VERIFY: console shows "Read only" when credentials exist but only the agent runs -->
+Nothing provisions nodes in this phase: the autoscaler policy is off and no cluster-controller is installed to execute actions. A strictly read-only connect (no IAM role at all) is possible with only `castai_eks_cluster` (no `assume_role_arn`) plus the agent; we pre-create IAM so phase 2 is one variable away.
+
+Side effect you will see in Step 8: because `assume_role_arn` is set, CAST AI already treats the cluster as phase 2 (`isPhase2: true`) and tries to reconcile it. With no cluster-controller installed, that reconcile fails with `cluster-controller not responding`, so the cluster `status` is `warning` (agent still `online`, reports still work). It turns `ready` within a minute of module 05 installing the cluster-controller. A strictly read-only connect (no role) would not show this.
 
 ## Demo
 
@@ -109,14 +111,14 @@ Shows exactly what will be created in AWS and in CAST AI.
 terraform -chdir=terraform init
 terraform -chdir=terraform plan -var phase=readonly
 ```
-Expected: `Terraform has been successfully initialized!`. Then either `No changes. Your infrastructure matches the configuration.` (connected during prep, the normal case) or, on a fresh cluster, a plan ending `Plan: 23 to add, 0 to change, 0 to destroy.` listing the resources in the table above. <!-- VERIFY: 23 on a fresh state -->
+Expected: `Terraform has been successfully initialized!`. Then either `No changes. Your infrastructure matches the configuration.` (connected during prep, the normal case) or, on a fresh cluster, a plan ending `Plan: 23 to add, 0 to change, 0 to destroy.` listing the resources in the table above (23 managed resources in state after the prep apply, plus 7 data sources).
 
 ### Step 4 — Apply
 Registers the cluster and installs the agent.
 ```bash
 terraform -chdir=terraform apply -var phase=readonly
 ```
-Type `yes` when asked. Expected: `Apply complete! Resources: 0 added, 0 changed, 0 destroyed.` after prep, or `Resources: 23 added` on a fresh cluster (the Helm release takes 1–2 minutes). Outputs include `castai_cluster_id = "<uuid>"`, `phase = "readonly"`, `autoscaler_enabled = false`.
+After prep there is no prompt: Terraform prints `No changes. Your infrastructure matches the configuration.` and `Apply complete! Resources: 0 added, 0 changed, 0 destroyed.` (about 7 s). On a fresh cluster it asks for `yes`, then `Resources: 23 added` (the Helm release takes 1–2 minutes). Outputs include `castai_cluster_id = "<uuid>"`, `phase = "readonly"`, `autoscaler_enabled = false`, `batch_template_offering = "disabled"`.
 
 Reload so `CASTAI_CLUSTER_ID` is set:
 ```bash
@@ -129,7 +131,7 @@ Expected: `CASTAI_CLUSTER_ID=<uuid>`.
 kubectl -n castai-agent get deploy,ds
 kubectl -n castai-agent get pods -o wide
 ```
-Expected: `castai-agent 1/1`, `castai-agent-cpvpa 1/1`, `castai-spot-handler` with one pod per spot node (0 if no spot nodes). The two agent pods run on the `t3a.large` system node; spot-handler pods on the Karpenter spot nodes. No `castai-cluster-controller`, `castai-evictor` or `castai-pod-pinner` yet. <!-- VERIFY: spot-handler schedules on Karpenter spot nodes -->
+Expected: `castai-agent 1/1`, `castai-agent-cpvpa 1/1`, `castai-spot-handler` with one pod per spot node (0 if no spot nodes). The two agent pods run on the `t3a.large` system node; spot-handler pods on the Karpenter spot nodes. No `castai-cluster-controller`, `castai-evictor` or `castai-pod-pinner` yet. The spot handler lands on Karpenter spot nodes because its node affinity matches `karpenter.sh/capacity-type=spot`.
 
 ### Step 6 — Prove it is read-only
 Ask the API server, not the vendor.
@@ -139,34 +141,36 @@ kubectl auth can-i delete pods -A --as=system:serviceaccount:castai-agent:castai
 kubectl auth can-i create nodes --as=system:serviceaccount:castai-agent:castai-agent
 kubectl auth can-i list pods -A --as=system:serviceaccount:castai-agent:castai-agent
 ```
-Expected: `no`, `no`, `no`, `yes`.
+Expected: `no`, `no`, `no`, `yes`. The third check also prints `Warning: resource 'nodes' is not namespace scoped`; harmless.
 
 ### Step 7 — Agent is sending data
 ```bash
-kubectl -n castai-agent logs deploy/castai-agent --tail=10
+kubectl -n castai-agent logs deploy/castai-agent -c agent --tail=-1 | grep 'upload finished' | tail -3
+kubectl -n castai-agent logs deploy/castai-agent -c agent --tail=-1 | grep -ciE 'EC2MetadataRequestError|response_code=40'
 ```
-Expected: recent lines about collecting and sending snapshots, no `401`/`403` and no `EC2MetadataRequestError`. <!-- VERIFY: exact log wording -->
+Expected: three `level=info msg="delta upload finished" ... items=38 ... response_code=204` lines, 15 s apart (a `full_snapshot=true` upload appears at start). Then `0`: no metadata errors and no 4xx answers. Startup also logs harmless `Skipping conditional informer ...` lines for APIs this cluster does not have.
 
 ### Step 8 — Cluster status via API
 ```bash
-scripts/castai-api.sh GET /v1/kubernetes/external-clusters/$CASTAI_CLUSTER_ID | jq '{name, status, agentStatus, isPhase2, managedBy, providerType, kubernetesVersion}'
+scripts/castai-api.sh GET /v1/kubernetes/external-clusters/$CASTAI_CLUSTER_ID | jq '{name, status, agentStatus, isPhase2, managedBy, providerType, kubernetesVersion, reconcileError}'
 ```
 Expected:
 ```json
 {
   "name": "karpenter-demo",
-  "status": "ready",
+  "status": "warning",
   "agentStatus": "online",
-  "isPhase2": false,
-  "managedBy": "terraform",
+  "isPhase2": true,
+  "managedBy": "terraform/9.8.0",
   "providerType": "eks",
-  "kubernetesVersion": "1.36"
+  "kubernetesVersion": "1.36",
+  "reconcileError": "cluster-controller not responding"
 }
 ```
-`agentStatus: online` means snapshots arrive. Right after a fresh connect it shows `waiting-connection` for a minute or two. <!-- VERIFY: isPhase2 and managedBy values when assume_role_arn is set but only the agent runs -->
+`agentStatus: online` means snapshots arrive. `status: warning` is expected here and is explained in Concepts: the IAM role makes it a phase-2 registration, and the reconcile needs the cluster-controller from module 05. Say so before someone asks.
 
 ### Step 9 — Console
-Console → **Clusters** → `karpenter-demo`. Expected: status **Connected**, mode **Read only** (or the cluster page offers "Enable CAST AI" / automation). The dashboard shows node count, CPU and memory provisioned vs requested within a few minutes of connecting. <!-- VERIFY: console label and nav names -->
+Console (https://console.cast.ai) → cluster list → `karpenter-demo`. Expected: the cluster is listed with a warning indicator (the same reconcile error as Step 8), and its dashboard shows 3 nodes, 10 CPU provisioned and about 7.7 CPU requested within a few minutes of connecting. Labels differ between the Enhanced and Classic console; the API output in Step 8 is the source of truth.
 
 ## Talking points
 - "You just saw the RBAC before it was installed: read-only cluster-wide, no Secrets, writes only to its own namespace."
@@ -180,11 +184,11 @@ Leave the cluster connected; modules 04–15 need it. To rehearse a fresh connec
 terraform -chdir=terraform destroy -var phase=readonly
 kubectl get ns castai-agent
 ```
-Expected: `Destroy complete! Resources: 23 destroyed.`, then `Error from server (NotFound): namespaces "castai-agent" not found` (or the namespace in `Terminating`). Module 15 covers full offboarding. <!-- VERIFY: helm uninstall removes the namespace (create_namespace=true) -->
+Expected: `Destroy complete! Resources: 23 destroyed.`, then `castai-agent   Active`: Helm never deletes a namespace it created, so remove it with `kubectl delete ns castai-agent`. Module 15 covers full offboarding (`scripts/offboard.sh` deletes the namespace).
 
 ## Q&A prep
 - **Can the agent read our Secrets?** No. `kubectl auth can-i get secrets` returned `no`. It reads configmaps only in `kube-system` and its own namespace.
 - **What if CAST AI is compromised?** In read-only mode, the in-cluster blast radius is read access to object metadata. The pre-created IAM role is the bigger exposure: it is scoped by tag and VPC, but can launch and terminate cluster-tagged instances. Skip it until phase 2 if that matters.
 - **Does the agent need IMDS or node IAM?** No. EKS facts come from env vars; it has no AWS credentials.
-- **How much does the agent cost to run?** About 100m CPU / 128Mi on the system node (cpvpa scales it with cluster size), plus the spot handler at 20m / 40Mi per spot node.
+- **How much does the agent cost to run?** Requests on the system node: 200m CPU (agent 100m + monitor sidecar 100m) and about 2.4 GiB memory, because cpvpa sets the agent's memory request (`2415919104` bytes here) from cluster size. Real use is ~3m CPU / ~40Mi. Plus the spot handler at 20m / 40Mi per spot node.
 - **Why not the console's one-line script or `castctl`?** It works, but on a Karpenter cluster it offers the Karpenter (Kent) path, and a Terraform-managed cluster should not be modified with `castctl`.

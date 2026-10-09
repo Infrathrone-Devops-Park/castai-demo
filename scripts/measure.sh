@@ -113,7 +113,7 @@ while [ "$i" -lt "$count" ]; do
   c="$(echo "$row" | jq -r .capacity)"
   if [ "$c" = "spot" ]; then p="$(spot_price "$t" "$z")"; else p="$(od_price "$t")"; fi
   [ -n "$p" ] || { echo "WARN: no price for $t $c $z" >&2; p=0; }
-  jq --argjson r "$row" --argjson p "$p" '. + [$r + {usdPerHour: $p}]' "${tmp}/priced.json" > "${tmp}/p2.json"
+  jq --argjson r "$row" --argjson p "$p" '. + [$r + {usdPerHour: ($p * 1)}]' "${tmp}/priced.json" > "${tmp}/p2.json"
   mv "${tmp}/p2.json" "${tmp}/priced.json"
   i=$((i+1))
 done
