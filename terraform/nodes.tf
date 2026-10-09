@@ -64,6 +64,7 @@ resource "castai_autoscaler_policies" "this" {
     enabled = true
     cpu {
       max_cores = 10
+      min_cores = 0
     }
   }
 
@@ -73,7 +74,8 @@ resource "castai_autoscaler_policies" "this" {
   }
 
   unschedulable_pods {
-    enabled = true
+    enabled                           = true
+    partial_template_matching_enabled = false
     pod_pinner {
       enabled = true
     }
