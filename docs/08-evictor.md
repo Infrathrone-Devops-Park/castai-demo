@@ -76,7 +76,7 @@ source scripts/env.sh
 EV="$CASTAI_API_URL/workload-eviction/v1/clusters/$CASTAI_CLUSTER_ID/config"
 kubectl get pods -n shop -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName --sort-by=.spec.nodeName
 ```
-Expected: 13 pods spread over 2–3 nodes. The default scheduler spreads replicas of one Deployment across nodes, so most nodes host a mix.
+Expected: 13 pods spread over 2–4 nodes (8 vCPU in total). The default scheduler spreads replicas of one Deployment across nodes, so most nodes host a mix.
 
 ### Step 2 — Evictor configuration (API, Terraform, Helm, console)
 ```bash
@@ -84,14 +84,15 @@ curl -s -H "X-API-Key: $CASTAI_API_KEY" "$EV" | jq '{enabled, dryRun, aggressive
 terraform -chdir=terraform state show castai_evictor.this | grep -E 'dry_run|aggressive|scoped|cycle|grace'
 kubectl get deploy -n castai-agent castai-evictor
 ```
-Expected: `{"enabled": true, "dryRun": false, "aggressiveMode": false, "scopedMode": true, "cycleInterval": "60s", "nodeGracePeriodMinutes": 5, "ignorePodDisruptionBudgets": false, "status": "EVICTOR_STATUS_COMPATIBLE"}`; Terraform matches; deployment `1/1` on the system node. `status` must be Compatible or the policy is not synced into the chart. Console: **Cluster → Autoscaler → Settings → Node deletion policy → Evictor** (toggles: Aggressive mode, Dry run). Scoped mode is Helm/API only. <!-- VERIFY: console labels -->
+Expected: `{"enabled": true, "dryRun": false, "aggressiveMode": false, "scopedMode": true, "cycleInterval": "60s", "nodeGracePeriodMinutes": 5, "ignorePodDisruptionBudgets": false, "status": "EVICTOR_STATUS_COMPATIBLE"}`; Terraform matches (`aggressive_mode = false`, `cycle_interval = "60s"`, `dry_run = false`, `node_grace_period_minutes = 5`, `scoped_mode = true`, plus `max/min_target_nodes_per_cycle = 0`); deployment `1/1` on the system node. `status` must be Compatible or the policy is not synced into the chart. Console (per docs.cast.ai): **Autoscaler settings → Node deletion policy → Evictor**, with an aggressive-mode option. Dry run and scoped mode are Helm/API/Terraform only.
 
 ### Step 3 — Dry-run on
 Read the config, flip one field, write the full object back.
 ```bash
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$EV" | jq -c 'del(.status) | .dryRun = true' | curl -s -X PATCH -H "X-API-Key: $CASTAI_API_KEY" -H 'Content-Type: application/json' --data-binary @- "$EV" | jq '{dryRun, aggressiveMode, scopedMode}'
 ```
-Expected: `{"dryRun": true, "aggressiveMode": false, "scopedMode": true}`. The in-cluster Evictor picks it up within a minute (the evictor pod may restart with new config). <!-- VERIFY: propagation time / restart -->
+Expected: `{"dryRun": true, "aggressiveMode": false, "scopedMode": true}`. The cluster-controller rolls the `castai-evictor` Deployment: a new evictor pod (new ReplicaSet hash) starts ~10–15 s later, and its log shows `DryRun=true` in `resolved config settings for the cycle`. Every config change restarts the pod, so older log lines are in the previous pod.
+Note: Terraform state still says `dry_run = false`; Step 7 puts the API back to that value.
 
 ### Step 4 — Make room: scale `shop` down partially
 Remove 3.4 vCPU of requests; the rest (2.6 vCPU) is all multi-replica, so default mode may move it.
@@ -109,43 +110,40 @@ echo "$KEEP"
 kubectl annotate node "$KEEP" autoscaling.cast.ai/removal-disabled=true
 kubectl label node "$KEEP" autoscaling.cast.ai/removal-disabled=true
 ```
-Expected: the node name, `node/... annotated`, `node/... labeled`. Docs accept the annotation or the label; we set both so the watch pane shows it. Karpenter equivalent: `karpenter.sh/do-not-disrupt: "true"` on the Node.
+Expected: the node name (the 4-vCPU node if there is one, else the first 2-vCPU node by name), `node/... annotated`, `node/... labeled`. Docs accept the annotation or the label; we set both so the watch pane shows it. Karpenter equivalent: `karpenter.sh/do-not-disrupt: "true"` on the Node.
 
 ### Step 6 — Dry-run output
 Wait two cycles, then read what it would do.
 ```bash
 sleep 120
-kubectl logs -n castai-agent deploy/castai-evictor --since=3m | grep -i -E 'dry|candidate|evict|node' | tail -10
+kubectl logs -n castai-agent deploy/castai-evictor --since=3m --tail=-1 | grep -E 'drainable nodes|dry run is enabled|eliminated by filters' | cut -c1-220 | tail -8
 kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai
 ```
-Expected: log lines naming the non-protected node(s) as candidates with a dry-run marker, and no eviction. Node list unchanged. <!-- VERIFY: exact log wording -->
+Expected (validation run): `msg="processing drainable nodes" ... nodes="[ip-10-0-42-181...]"` and `msg="dry run is enabled, operation is NOOP" ... node_name=ip-10-0-42-181...`, plus the filter verdicts for the others: `#1 node - <system node> eliminated by filters, reason: not managed by CAST AI`, `... <KEEP> ... reason: marked with removal disabled`, and for the node running the WA exporter `reason: single replica - castai-agent/castai-workload-autoscaler-exporter-...`. No eviction; node list unchanged.
 
 ### Step 7 — Dry-run off: real compaction
 ```bash
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$EV" | jq -c 'del(.status) | .dryRun = false' | curl -s -X PATCH -H "X-API-Key: $CASTAI_API_KEY" -H 'Content-Type: application/json' --data-binary @- "$EV" | jq '{dryRun}'
 T0=$(date -u +%s)
 ```
-Expected: `{"dryRun": false}`. Then, in the panes, within ~1–3 min:
-1. A non-protected node gets taint `evictor.cast.ai/evicting:NoSchedule`; its `shop` pods terminate and start on `$KEEP` (no Pending phase longer than seconds, because the space already exists).
-2. The node gets `evictor.cast.ai/evicted`, is empty, and is deleted by the node deletion policy.
-3. Repeat for any third node.
+Expected: `{"dryRun": false}`. Then, in the panes (validation run, times after the PATCH):
+1. ~+15 s the evictor pod restarts with the new config; ~+80 s the candidate node goes `SchedulingDisabled` and its `shop` pods (`cart`, `frontend`, `payments` replicas) are evicted and start again within seconds on `$KEEP` and the exporter's node.
+2. The node is empty and goes away; Kubernetes events on it: `NodeNotSchedulable`, `Shutdown`, then `DeletingNode ... because it does not exist in the cloud provider`. Gone at ~+2.5–3 min.
+3. The node hosting the WA exporter stays (single replica).
 
 ### Step 8 — Verify the result
 ```bash
 kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai -L node.kubernetes.io/instance-type
 kubectl get pods -n shop --no-headers -o custom-columns=NODE:.spec.nodeName | sort | uniq -c
-kubectl logs -n castai-agent deploy/castai-evictor --since=10m | grep -i -E 'evict|drain' | tail -8
+kubectl logs -n castai-agent deploy/castai-evictor --since=10m --tail=-1 | grep -E 'started evicting pods|drainable nodes|eliminated by filters' | cut -c1-220 | tail -8
 ```
-Expected:
-- If `$KEEP` is a 4-vCPU node: only `$KEEP` remains, all 7 `shop` pods on it (2.6 vCPU fits in ~3.7 allocatable after DaemonSets).
-- If every node was 2-vCPU: two nodes remain (2.6 vCPU does not fit on one).
-- `$KEEP` is never drained. Logs show eviction of the moved pods and the node. <!-- VERIFY: log wording -->
+Expected (validation run): two CAST AI nodes remain: `$KEEP` (`c6a.xlarge`, 4 pods) and the exporter's `c8i-flex.large` (3 pods). If the exporter happens to sit on `$KEEP` or on the system node, only `$KEEP` remains with all 7 pods. `$KEEP` is never drained. Logs: `started evicting pods from a node ... node_name=<drained node>`, then later cycles show `reason: already drained`, `reason: marked with removal disabled`, `reason: single replica - ...exporter...` and `couldn't find any nodes to drain`.
 
-Same check from the API (node count and fleet price):
+Same check from the API (node count and fleet price). The node list has no price (`spotConfig.price` is empty); the cost report summary has it:
 ```bash
-curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CASTAI_API_URL/v1/kubernetes/external-clusters/$CASTAI_CLUSTER_ID/nodes" | jq -r '.items[] | [.name, .instanceType, (.spotConfig.price // .instancePrice // "-")] | @tsv'
+curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CASTAI_API_URL/v1/cost-reports/clusters/$CASTAI_CLUSTER_ID/summary" | jq '.summary | {nodeCountSpotCastai, costHourlySpot, costHourlyOnDemand}'
 ```
-Expected: system node + the remaining CAST AI node(s) with their hourly price. <!-- VERIFY: price field -->
+Expected (validation run): `{"nodeCountSpotCastai": "2", "costHourlySpot": "0.065560", "costHourlyOnDemand": "0.049340"}` (strings). Spot = `c8i-flex.large` 0.0163 + `c6a.xlarge` 0.0493; on-demand = the system node. Before compaction it was one more `c8i-flex.large` (+0.0163/h). The summary refreshes every few minutes.
 
 ### Step 9 — PDBs are respected
 A PDB that allows zero disruptions for `payments` (2 replicas, `minAvailable: 2`).
@@ -175,12 +173,13 @@ Back to the module 06 end state.
 source scripts/env.sh
 kubectl delete -f manifests/08-evictor/pdb-payments.yaml --ignore-not-found
 for n in $(kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai -o name); do kubectl annotate "$n" autoscaling.cast.ai/removal-disabled-; kubectl label "$n" autoscaling.cast.ai/removal-disabled-; done
-terraform -chdir=terraform apply -auto-approve -var phase=automation -var autoscaler_enabled=true
+terraform -chdir=terraform plan -out=tfplan -var phase=automation -var autoscaler_enabled=true
+terraform -chdir=terraform apply tfplan
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CASTAI_API_URL/workload-eviction/v1/clusters/$CASTAI_CLUSTER_ID/config" | jq '{dryRun, aggressiveMode, scopedMode}'
 kubectl apply -f workloads/shop.yaml
 for d in frontend cart catalog checkout payments worker; do kubectl rollout status deploy/$d -n shop --timeout=10m; done
 ```
-Expected: PDB deleted, annotation/label removed (`not found` messages are harmless), `Apply complete!` with `0 changed` if Step 7 restored `dryRun=false` (1 changed if drift remained), evictor `{"dryRun": false, "aggressiveMode": false, "scopedMode": true}`, then CAST AI adds spot capacity and all six deployments roll out (~3 min).
+Expected: PDB deleted; per node `annotated` and `unlabeled` (or `label "autoscaling.cast.ai/removal-disabled" not found.` / `not labeled`: harmless); `No changes.` and `Apply complete! Resources: 0 added, 0 changed, 0 destroyed.` if Step 7 restored `dryRun=false` (1 changed if drift remained); evictor `{"dryRun": false, "aggressiveMode": false, "scopedMode": true}`; `catalog`, `checkout`, `worker` `configured`, then CAST AI adds one spot node and all six deployments roll out (validation: ~70 s).
 
 ## Q&A prep
 - **Does the Evictor use utilization thresholds?** No. It simulates whether all evictable pods of a node fit elsewhere; even a busy node may be drained if that packs better.

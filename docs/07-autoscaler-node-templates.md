@@ -47,7 +47,7 @@ Evictor (bin-packing) is a separate resource since V2; module 08.
 ### Capacity in this module
 | Part | CAST AI vCPU | Quota check |
 |---|---|---|
-| Lab profile (shop at 1 replica each, `worker` 0 = 2.1 vCPU requested) | ~4 spot | spot 4/8 |
+| Lab profile (shop at 1 replica each, `worker` 0 = 2.1 vCPU requested) | ~4 spot (validation: 2× `c8i-flex.large`) | spot 4/8 |
 | `batch` template, 2 pods | +2 on-demand | OD 2 + 2 = 4/8, cluster 2 + 4 + 2 = 8/10 |
 | CPU-limit test (8 pods) | +2 on-demand more, then blocked | OD 6/8, cluster 10/10 |
 
@@ -70,7 +70,7 @@ POL="$CASTAI_API_URL/cluster-autoscaler/v2/clusters/$CASTAI_CLUSTER_ID/policies"
 kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai
 kubectl get deploy -n shop
 ```
-Expected: 2–3 CAST AI nodes `Ready`; six `shop` deployments `3/3` or `2/2`.
+Expected: 2–4 CAST AI nodes `Ready` (8 vCPU in total); six `shop` deployments `3/3` or `2/2`.
 
 ### Step 2 — Read the policies (API, Terraform, console)
 ```bash
@@ -85,31 +85,40 @@ Expected JSON (shape):
  "clusterLimits": {"enabled": true, "cpu": {"maxCores": 10}},
  "nodeDownscaler": {"emptyNodesEnabled": true, "emptyNodesDelay": "60s"}}
 ```
-Terraform shows the same values (`max_cores = 10`, `empty_nodes_delay = "60s"`). Console: **Cluster → Autoscaler → Settings** (newer console: **Cluster → Settings → Node autoscaling advanced settings → Scaling policies**). <!-- VERIFY: console path in this org -->
+Real output also has `"minCores": 0` under `cpu` and `"version"` as a counter string (`"3"` after module 06; it increments on every write). Terraform shows the same values (`max_cores = 10`, `empty_nodes_delay = "60s"`, `partial_template_matching_enabled = false`). Console (per docs.cast.ai): **Cluster → Autoscaler → Settings**; newer console: **Cluster → Settings → Node autoscaling advanced settings → Scaling policies** (the "CPU limit policy" lives there). Scoped mode is not in the console (API/Terraform only).
 Point out there is no `headroom` key: V2 removed it.
 
 ### Step 3 — Read the default template
 ```bash
-curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CL/node-templates" | jq '.items[] | {name: .template.name, enabled: .template.isEnabled, stats, c: (.template.constraints | {spot, onDemand, useSpotFallbacks, fallbackRestoreRateSeconds, minCpu, maxCpu, architectures, burstable, azs, resourceLimits})}'
+curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CL/node-templates?includeDefault=true" | jq '.items[] | {name: .template.name, enabled: .template.isEnabled, stats, c: (.template.constraints | {spot, onDemand, useSpotFallbacks, fallbackRestoreRateSeconds, minCpu, maxCpu, architectures, burstable, azs, resourceLimits})}'
 ```
-Expected: one item `default-by-castai`, `enabled true`, stats `countSpot` 2–3, constraints `spot true`, `onDemand false`, `useSpotFallbacks true`, `fallbackRestoreRateSeconds 1800`, `minCpu 2`, `maxCpu 4`, `architectures ["amd64"]`, `resourceLimits {"cpuLimitEnabled": true, "cpuLimitMaxCores": 8}`. Console: **Cluster → Autoscaler → Node templates → default-by-castai** ("Select resource offering", "Instance constraints", "CPU limit"). <!-- VERIFY: burstable field shape -->
+`?includeDefault=true` is required: without it the API omits `default-by-castai` and returns nothing.
+Expected: one item `default-by-castai`, `enabled true`, stats `{"countOnDemand": 0, "countSpot": 4, "countFallback": 0, "countSoleTenant": 0}` (spot count = CAST AI nodes), constraints `spot true`, `onDemand false`, `useSpotFallbacks true`, `fallbackRestoreRateSeconds 1800`, `minCpu 2`, `maxCpu 4`, `architectures ["amd64"]`, `burstable "NOT_SET"` (we never set it on the default template), `azs []` (all subnets of the node configuration), `resourceLimits {"cpuLimitEnabled": true, "cpuLimitMaxCores": 8}`. Console: **Cluster → Autoscaler → Node templates → default-by-castai** ("Select resource offering", "Instance constraints", "CPU limit").
 
 ### Step 4 — Enter the lab profile (free capacity)
-`shop` full uses all 8 spot vCPU the template may hold. Scale to zero (empty nodes are deleted after 60 s), then back to one replica each. Deterministic, ~4 min.
+`shop` full uses all 8 spot vCPU the template may hold. Scale to zero (empty nodes are deleted after 60 s), then back to one replica each. ~3–4 min.
+One CAST AI node usually stays: it hosts `castai-workload-autoscaler-exporter` (1 replica, 500m), which default-mode Evictor will not move. So we wait for "at most one" node, not "none".
 ```bash
 kubectl scale deploy -n shop --all --replicas=0
-kubectl wait node -l provisioner.cast.ai/managed-by=cast.ai --for=delete --timeout=600s
+until [ "$(kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai --no-headers | wc -l)" -le 1 ]; do sleep 15; done
 kubectl scale deploy -n shop frontend cart catalog checkout payments --replicas=1
 for d in frontend cart catalog checkout payments; do kubectl rollout status deploy/$d -n shop --timeout=10m; done
 kubectl get nodes -l provisioner.cast.ai/managed-by=cast.ai -L node.kubernetes.io/instance-type,scheduling.cast.ai/spot
 ```
-Expected: all CAST AI nodes deleted ~1.5–2.5 min after the scale-down (60 s delay + termination). Node deletion policy at work: this is Karpenter's `WhenEmpty`. Then one new spot node (usually 4 vCPU; two 2-vCPU nodes also possible) and five `successfully rolled out` lines within ~2–4 min.
+Expected: empty CAST AI nodes go `SchedulingDisabled`, then disappear ~2–3 min after the scale-down (60 s delay + drain + termination). Node deletion policy at work: this is Karpenter's `WhenEmpty`. A node that hosts a replica of `castai-pod-mutator` (2 replicas) is drained by the Evictor once it is older than 5 min; the exporter's node stays. The `until` loop returns when one node is left. Then one new spot node (validation: a second `c8i-flex.large`, 2 vCPU) and five `successfully rolled out` lines within ~1 min.
+
+Optional proof of why one node stays:
+```bash
+kubectl logs -n castai-agent deploy/castai-evictor --since=5m --tail=-1 | grep -o 'reason: single replica[^"]*' | sort -u
+```
+Expected: `reason: single replica - castai-agent/castai-workload-autoscaler-exporter-...`.
 
 ### Step 5 — Create the `batch` template with Terraform
 On-demand, exactly 2 vCPU, families c6a/c5a/m6a/m5a, no burstable, labels `workload=batch` + `team=data`, taint `workload=batch:NoSchedule`, template CPU limit 4.
 ```bash
 sed -n '/resource "castai_node_template" "batch"/,/^}/p' terraform/templates-demo.tf
-terraform -chdir=terraform apply -auto-approve -var phase=automation -var autoscaler_enabled=true -var enable_batch_template=true
+terraform -chdir=terraform plan -out=tfplan -var phase=automation -var autoscaler_enabled=true -var enable_batch_template=true
+terraform -chdir=terraform apply tfplan
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$CL/node-templates" | jq '.items[] | select(.template.name=="batch") | .template | {name, shouldTaint, customLabels, customTaints, c: (.constraints | {spot, onDemand, minCpu, maxCpu, instanceFamilies, resourceLimits})}'
 ```
 Expected: `Apply complete! Resources: 1 added, 0 changed, 0 destroyed.` and output `batch_template_offering = "on-demand"`. API: `customLabels {"team":"data","workload":"batch"}`, `customTaints [{"key":"workload","value":"batch","effect":"NoSchedule"}]`, `onDemand true`, `spot false`, `instanceFamilies {"include":["c6a","c5a","m6a","m5a"]}`, CPU limit 4. Console: the template appears under **Node templates**.
@@ -125,7 +134,7 @@ sleep 60
 kubectl get pods -n castai-lab
 kubectl get events -n castai-lab --sort-by=.lastTimestamp | tail -5
 ```
-Expected: namespace and deployment created; both pods `Pending` after 60 s; events `FailedScheduling` (node selector mismatch) and no new node. By default a pod must match **all** custom labels of a template, and no template can produce `workload=batch` alone. <!-- VERIFY: whether CAST AI emits an explicit "no matching node template" event -->
+Expected: namespace and deployment created; both pods `Pending` after 60 s; no new node. Events: `FailedScheduling` from the scheduler (`... didn't match Pod's node affinity/selector`) and, from CAST AI, `FailedUpscaling   Impossible to schedule pod, no instance type matches selectors. For example: workload=batch. (Node template: default-by-castai)`. By default a pod must match **all** custom labels of a template; CAST AI falls back to the default template, which cannot produce `workload=batch`.
 
 ### Step 7 — Turn on partial template matching
 API (read, flip one field, write back with `version` for optimistic locking):
@@ -140,12 +149,12 @@ kubectl wait pods -n castai-lab -l app=batch --for=condition=Ready --timeout=600
 kubectl get nodes -l scheduling.cast.ai/node-template=batch -L node.kubernetes.io/instance-type,scheduling.cast.ai/on-demand,workload,team
 kubectl get node -l scheduling.cast.ai/node-template=batch -o jsonpath='{.items[0].spec.taints}{"\n"}'
 ```
-Expected: within ~2–3 min one new 2-vCPU on-demand node (for example `c6a.large` / `c5a.large`), `ON-DEMAND true`, `WORKLOAD batch`, `TEAM data`; taints include `{"effect":"NoSchedule","key":"workload","value":"batch"}`. Both pods `condition met`. <!-- VERIFY: whether the default node-template taint is added next to the custom one -->
-Then show why it chose `batch`:
+Expected: `{"enabled": true, "podPinner": {"enabled": true, "status": "POD_PINNER_STATUS_COMPATIBLE"}, "partialTemplateMatchingEnabled": true}`. Then within ~1–2 min (validation: 67 s) one new 2-vCPU on-demand node `c6a.large`, `ON-DEMAND true`, `WORKLOAD batch`, `TEAM data`; taints exactly `[{"effect":"NoSchedule","key":"workload","value":"batch"}]` (no extra template taint). Both pods `condition met`.
+Then show what CAST AI decided:
 ```bash
-kubectl get events -n castai-lab --sort-by=.lastTimestamp | grep -i -E 'template|unschedul|cast' | tail -3
+kubectl get events -n castai-lab --field-selector reason=NodeCreationTriggered
 ```
-Expected: an "Unscheduled Pods Policy Applied" style event naming the matched template. <!-- VERIFY: event reason text -->
+Expected: `CAST.AI autoscaler triggered node creation for this pod (node: <uuid>, instance type: c6a.large)`. The event names the instance type, not the template; the node's `NODE-TEMPLATE batch` label above shows the match.
 
 ### Step 8 — Template CPU limit stops the scale-up
 Template limit is 4 vCPU = two 2-vCPU nodes. 8 pods x 500m need three.
@@ -156,20 +165,20 @@ kubectl get pods -n castai-lab --no-headers | awk '{print $3}' | sort | uniq -c
 kubectl get nodes -l scheduling.cast.ai/node-template=batch
 kubectl get events -n castai-lab --sort-by=.lastTimestamp | grep -i -E 'limit|cpu' | tail -3
 ```
-Expected: `6 Running` and `2 Pending` (3 pods of 500m fit per 2-vCPU node), exactly 2 batch nodes, and an event saying autoscaling failed because of the node template CPU limit. Cluster CPU (2 + 4 + 4 = 10) is also at its limit, so the message may name the cluster limit instead; both are guard rails doing their job. <!-- VERIFY: exact message -->
+Expected: `2 Pending` and `6 Running` (3 pods of 500m fit per 2-vCPU node), exactly 2 batch nodes, and events like `FailedUpscaling   Node template CPU limit reached. Instance type: c6a.large. (Node template: batch)`. CAST AI retries every ~60 s with the next family (`m6a.large`, `m5a.large`, `c5a.large`), each refused the same way. Cluster CPU (2 + 4 + 4 = 10) is also at its limit; in the validation run the template limit was the one reported.
 Karpenter equivalent: NodePool `limits.cpu: 4` leaves pods Pending with `all available instance types exceed limits for nodepool`.
 ```bash
 kubectl scale deploy batch -n castai-lab --replicas=2
 ```
-Expected: 6 pods terminate; within ~2 min one batch node becomes empty and is deleted (60 s policy).
+Expected: 6 pods terminate; ~2 min later one batch node becomes empty and is deleted (60 s policy).
 
 ### Step 9 — Pod Pinner
 ```bash
 kubectl get deploy -n castai-agent castai-pod-pinner
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$POL" | jq -r '.unschedulablePods.podPinner.status'
-kubectl logs -n castai-agent deploy/castai-pod-pinner --since=15m | grep -i -E 'pin|bind' | tail -5
+kubectl logs -n castai-agent deploy/castai-pod-pinner --since=15m --tail=-1 | grep -o '"msg":"[^"]*"' | sort | uniq -c
 ```
-Expected: `1/1`, `POD_PINNER_STATUS_COMPATIBLE`, and log lines about pinning/binding the `castai-lab` and `shop` pods to planned nodes. <!-- VERIFY: log wording -->
+Expected: `1/1`, `POD_PINNER_STATUS_COMPATIBLE`, and JSON-log message counts including `received pod pinning actions` (one per planned node), `patching pod` and `pod pinned` (one per pinned `castai-lab`/`shop` pod), `node already exists` (the real node registered before pinning, so no placeholder Node was needed).
 Talk track: Pod Pinner uses the `/pods/binding` API so pods land where the autoscaler planned. Not compatible with webhooks that change scheduling fields after pinning (Kyverno, CAST AI pod mutations, sidecar injectors).
 
 ### Step 10 — Headroom without a headroom policy
@@ -195,16 +204,17 @@ POL="$CASTAI_API_URL/cluster-autoscaler/v2/clusters/$CASTAI_CLUSTER_ID/policies"
 kubectl delete ns castai-lab --ignore-not-found
 kubectl wait node -l scheduling.cast.ai/node-template=batch --for=delete --timeout=600s
 curl -s -H "X-API-Key: $CASTAI_API_KEY" "$POL" | jq -c 'del(.unschedulablePods.podPinner.status) | .unschedulablePods.partialTemplateMatchingEnabled = false' | curl -s -X PATCH -H "X-API-Key: $CASTAI_API_KEY" -H 'Content-Type: application/json' --data-binary @- "$POL" | jq '.unschedulablePods.partialTemplateMatchingEnabled'
-terraform -chdir=terraform apply -auto-approve -var phase=automation -var autoscaler_enabled=true
+terraform -chdir=terraform plan -out=tfplan -var phase=automation -var autoscaler_enabled=true
+terraform -chdir=terraform apply tfplan
 kubectl apply -f workloads/shop.yaml
 for d in frontend cart catalog checkout payments worker; do kubectl rollout status deploy/$d -n shop --timeout=10m; done
 ```
-Expected: namespace deleted, batch nodes gone (or `no matching resources found` if already gone), `false`, `Apply complete! Resources: 0 added, 0 changed, 1 destroyed.` (the `batch` template), six `successfully rolled out` lines after CAST AI adds 1–2 spot nodes (~3 min).
+Expected: namespace deleted, batch node gone ~2 min later (`condition met`; or `no matching resources found` if already gone), `false`, plan `0 to add, 0 to change, 1 to destroy.` and `Apply complete! Resources: 0 added, 0 changed, 1 destroyed.` (the `batch` template), `deployment.apps/... configured` x6, six `successfully rolled out` lines after CAST AI adds 1–2 spot nodes (validation: one `c6a.xlarge`, ~70 s). Total ~3.5 min.
 
 ## Q&A prep
 - **Is partial matching risky?** Yes: a pod selecting a common label (for example `team=data`) can land on an unintended template. Prefer the explicit template selector.
 - **What if two templates match equally?** More matched terms first, then average price per CPU, then name (documented order). Karpenter: highest `weight`, then any compatible pool.
-- **Does changing a template replace existing nodes (like Karpenter drift)?** No automatic drift replacement; use the Rebalancer (module 09). <!-- VERIFY -->
+- **Does changing a template replace existing nodes (like Karpenter drift)?** No automatic drift replacement; use the Rebalancer (module 09). Module 09 Step 4 shows it: the template flips to spot, the running node stays on-demand.
 - **Template CPU limit vs quota?** The limit is CAST AI's; AWS quota is separate. Keep the sum of template limits within quota, as we do (8 spot + 4 OD).
 - **Can a pod refine instance choice inside a template?** Yes, extra `nodeSelector`/affinity (for example `scheduling.cast.ai/instance-family`) that does not conflict with the template.
 - **Why no `t` (burstable) instances?** Sustained load burns CPU credits; "unlimited" surcharges distort $/h. Same rule as the Karpenter NodePool.

@@ -83,8 +83,11 @@ fi
 
 # 4. Terraform to baseline vars
 log "terraform apply phase=automation autoscaler_enabled=true enable_workload_autoscaler=false"
-terraform -chdir=terraform apply -auto-approve -input=false \
+# saved plan, no blind apply
+terraform -chdir=terraform plan -input=false -out=tfplan \
   -var phase=automation -var autoscaler_enabled=true -var enable_workload_autoscaler=false
+terraform -chdir=terraform apply -input=false tfplan
+rm -f terraform/tfplan
 CID="$(terraform -chdir=terraform output -raw castai_cluster_id)"
 [ -n "${CID}" ] || die "castai_cluster_id output empty"
 

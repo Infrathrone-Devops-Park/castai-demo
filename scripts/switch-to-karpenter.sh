@@ -10,7 +10,8 @@ source scripts/env.sh >/dev/null
 
 KNS="${KARPENTER_NAMESPACE}"
 MAX_WAIT=900
-FORCE_AFTER=420
+# node delete leaves instance running
+FORCE_AFTER=45
 ANN=castai-demo/original-cpu-limit
 SEL=provisioner.cast.ai/managed-by=cast.ai
 
@@ -37,9 +38,12 @@ castai_instances() {
 
 # 1. stop CAST AI scaling
 log "terraform apply phase=automation autoscaler_enabled=false"
-terraform -chdir=terraform apply -auto-approve -input=false \
+# saved plan, no blind apply
+terraform -chdir=terraform plan -input=false -out=tfplan \
   -var phase=automation -var autoscaler_enabled=false \
   ${TF_KEEP[@]+"${TF_KEEP[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}
+terraform -chdir=terraform apply -input=false tfplan
+rm -f terraform/tfplan
 
 # 2. delete CAST AI nodes
 log "Deleting CAST AI nodes (shop pods go Pending)"

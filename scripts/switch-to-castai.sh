@@ -82,9 +82,12 @@ echo "    karpenter pods: 0"
 
 # 5. enable CAST AI autoscaler
 log "terraform apply phase=automation autoscaler_enabled=true"
-terraform -chdir=terraform apply -auto-approve -input=false \
+# saved plan, no blind apply
+terraform -chdir=terraform plan -input=false -out=tfplan \
   -var phase=automation -var autoscaler_enabled=true \
   ${TF_KEEP[@]+"${TF_KEEP[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}
+terraform -chdir=terraform apply -input=false tfplan
+rm -f terraform/tfplan
 
 # 6. wait CAST AI nodes, pods
 log "Waiting for CAST AI nodes and shop pods"
