@@ -39,7 +39,8 @@ api() { scripts/castai-api.sh "$@"; }
 [ -n "${TF_VAR_castai_api_token:-}" ] || die "~/.castai/api-token missing"
 [ -n "$(terraform -chdir=terraform state list 2>/dev/null)" ] || die "terraform state empty (offboarded?)"
 
-# pods whose requests differ from template
+# spec or allocated != template
+# (deferred resize keeps old allocation)
 drifted_pods() {
   kubectl -n "${NS}" get deploy,pods -o json | jq -r '
     ([.items[] | select(.kind == "Deployment")
@@ -47,8 +48,17 @@ drifted_pods() {
      | from_entries) as $want
     | .items[] | select(.kind == "Pod")
     | select(.metadata.labels.app as $a | $want[$a] != null
-        and $want[$a] != (.spec.containers[0].resources.requests | tostring))
+        and ($want[$a] != (.spec.containers[0].resources.requests | tostring)
+          or $want[$a] != ((.status.containerStatuses[0].resources.requests // .spec.containers[0].resources.requests) | tostring)))
     | .metadata.name'
+}
+
+# WA Recommendation CRs for live Deployments
+live_recs() {
+  kubectl -n "${NS}" get deploy,recommendations.autoscaling.cast.ai -o json 2>/dev/null | jq -r '
+    [.items[] | select(.kind == "Deployment") | .metadata.name] as $d
+    | .items[] | select(.kind == "Recommendation")
+    | select(.spec.targetRef.name as $t | $d | index($t)) | .metadata.name'
 }
 
 # 1. annotations first, then policy
@@ -56,6 +66,16 @@ log "Removing Workload Autoscaler annotations in ${NS}"
 for d in $(kubectl -n "${NS}" get deploy -o name 2>/dev/null); do
   kubectl -n "${NS}" annotate "${d}" "${WA_ANN}-" >/dev/null 2>&1 || true
 done
+
+# webhook mutates until CRs finalize
+if kubectl get crd recommendations.autoscaling.cast.ai >/dev/null 2>&1; then
+  START=$(date +%s)
+  while [ -n "$(live_recs)" ]; do
+    [ "$(elapsed)" -ge 300 ] && { warn "Recommendation CRs still present: $(live_recs | xargs)"; break; }
+    echo "    $(elapsed)s: waiting for WA to release: $(live_recs | xargs)"
+    sleep 10
+  done
+fi
 
 # 2. module 07-13 extras
 log "Removing castai-lab, burst job, HPA workload, VPA"
@@ -136,6 +156,16 @@ for d in $(kubectl -n "${NS}" get deploy -o name); do
   echo "${want}" | grep -qx "${d}" || { echo "    delete ${d}"; kubectl -n "${NS}" delete "${d}" --wait=false >/dev/null; }
 done
 kubectl -n "${NS}" delete jobs,cronjobs,pdb --all --ignore-not-found >/dev/null
+# WA CRs of deleted Deployments
+if kubectl get crd recommendations.autoscaling.cast.ai >/dev/null 2>&1; then
+  kubectl -n "${NS}" get deploy,recommendations.autoscaling.cast.ai -o json | jq -r '
+    [.items[] | select(.kind == "Deployment") | .metadata.name] as $d
+    | .items[] | select(.kind == "Recommendation")
+    | select(.spec.targetRef.name as $t | ($d | index($t)) | not) | .metadata.name' \
+    | while read -r r; do
+        [ -n "${r}" ] && kubectl -n "${NS}" delete recommendations.autoscaling.cast.ai "${r}" --wait=false >/dev/null
+      done
+fi
 if [ "${KEEP_HPA:-0}" != "1" ]; then
   kubectl -n "${NS}" delete hpa --all --ignore-not-found >/dev/null
 fi

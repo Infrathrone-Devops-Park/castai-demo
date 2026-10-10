@@ -101,6 +101,7 @@ Rules that follow from it:
 | T-4 h | Connect read-only (history starts now) | `terraform -chdir=terraform apply -var phase=readonly` |
 | T-4 h (≥3 h before module 11) | Deploy `shop` | `kubectl apply -f workloads/shop.yaml` |
 | T-3 h | Spot-check usage | `kubectl top pods -n shop` shows ~100m per frontend pod |
+| T-1 day (optional) | Full rightsizing in module 11: Workload Autoscaler installed ≥24 h | `terraform -chdir=terraform plan -out=tfplan -var phase=automation` then `terraform -chdir=terraform apply tfplan` (autoscaler stays off). Without it, module 11 changes are capped at 25 % (install < 6 h) or 35 % (< 24 h); module 05 Step 9 then shows `No changes` |
 | T-30 min | Health checks (Demo below) | steps 1–6 |
 | T-30 min | Fresh price cache | `rm -f results/price-cache.json` |
 

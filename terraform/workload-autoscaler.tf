@@ -16,7 +16,7 @@ resource "castai_workload_scaling_policy" "shop" {
   apply_type = "IMMEDIATE"
 
   # enabled per workload instead
-  # manual enable skips gradual caps
+  # manual enable skips confidence gate
   management_option = "READ_ONLY"
 
   assignment_rules {

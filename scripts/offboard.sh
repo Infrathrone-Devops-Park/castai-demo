@@ -35,7 +35,19 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 tf_has_state() { [ -n "$(terraform -chdir=terraform state list 2>/dev/null)" ]; }
 PHASE="$(terraform -chdir=terraform output -raw phase 2>/dev/null || echo automation)"
 case "${PHASE}" in readonly|automation) ;; *) PHASE=automation ;; esac
-TFV=(-input=false -auto-approve -var "phase=${PHASE}" -var autoscaler_enabled=false -var enable_workload_autoscaler=false)
+TFV=(-input=false -var "phase=${PHASE}" -var autoscaler_enabled=false -var enable_workload_autoscaler=false)
+
+# saved plan, no blind apply
+tf_apply() {
+  terraform -chdir=terraform plan -out=tfplan "${TFV[@]}" "$@" \
+    && terraform -chdir=terraform apply -input=false tfplan
+  local rc=$?; rm -f terraform/tfplan; return "${rc}"
+}
+tf_destroy() {
+  terraform -chdir=terraform plan -destroy -out=tfplan "${TFV[@]}" "$@" \
+    && terraform -chdir=terraform apply -input=false tfplan
+  local rc=$?; rm -f terraform/tfplan; return "${rc}"
+}
 
 castai_instances() {
   aws ec2 describe-instances \
@@ -57,16 +69,16 @@ if tf_has_state; then
   cnodes="$(kubectl get nodes -l "${SEL}" -o name 2>/dev/null | wc -l | tr -d ' ')"
   if [ "${kreplicas:-0}" = "0" ] || [ "${cnodes}" != "0" ]; then
     log "Switching back to Karpenter"
-    scripts/switch-to-karpenter.sh
+    scripts/switch-to-karpenter.sh -var enable_workload_autoscaler=false
   fi
 
   # 3. autoscaler + WA policy off
   log "terraform apply autoscaler_enabled=false enable_workload_autoscaler=false"
-  terraform -chdir=terraform apply "${TFV[@]}"
+  tf_apply
 
   # 4. policies and template
   log "Destroying policies, evictor, node template"
-  terraform -chdir=terraform destroy "${TFV[@]}" \
+  tf_destroy \
     -target=castai_workload_scaling_policy.shop \
     -target=castai_evictor.this \
     -target=castai_autoscaler_policies.this \
@@ -75,7 +87,7 @@ if tf_has_state; then
 
   # 5. cluster; dependents (helm) go first
   log "Destroying castai_eks_cluster (disconnect, delete CAST AI nodes)"
-  if ! terraform -chdir=terraform destroy "${TFV[@]}" -target=castai_eks_cluster.this; then
+  if ! tf_destroy -target=castai_eks_cluster.this; then
     echo "Helm hook stuck? Recover with:" >&2
     echo "  helm uninstall castai -n castai-agent --no-hooks" >&2
     echo "  terraform -chdir=terraform state rm helm_release.castai" >&2
@@ -91,7 +103,7 @@ if tf_has_state; then
 
   # 6. remaining resources (IAM, ids)
   log "Destroying remaining Terraform resources"
-  terraform -chdir=terraform destroy "${TFV[@]}"
+  tf_destroy
 else
   log "Terraform state empty; skipping Terraform steps"
 fi

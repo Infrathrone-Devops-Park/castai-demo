@@ -120,7 +120,7 @@ END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 scripts/castai-api.sh GET "/v1/cost-reports/clusters/$CASTAI_CLUSTER_ID/efficiency?startTime=$START&endTime=$END&stepSeconds=3600" > results/castai-efficiency-baseline.json
 jq '{current: (.current | {cpuProvisioned, cpuRequested, cpuUsed, cpuOverprovisioningPercent}), summary: (.summary | {cpuOverprovisioningPercent, costPerCpuProvisioned, costPerCpuRequested, costPerCpuUsed})}' results/castai-efficiency-baseline.json
 ```
-Expected: `cpuProvisioned` ≈ 10, `cpuRequested` ≈ 7–8, `cpuUsed` ≈ 2; `costPerCpuUsed` several times `costPerCpuProvisioned`. That ratio is the waste in dollars. If `noDataReason` is set instead, the agent has not sent enough history yet.
+Expected: `cpuProvisioned` ≈ 10, `cpuRequested` ≈ 7–8, `cpuUsed` ≈ 2. On a cluster connected the same day the `summary` cost fields are all `"0.000000"` (checked up to 4 h after connect): cost history is not ready yet. Use `current` only; once history exists, `costPerCpuUsed` several times `costPerCpuProvisioned` is the waste in dollars.
 
 ### Step 6 — Cost per namespace
 Who pays for the waste.
@@ -128,7 +128,7 @@ Who pays for the waste.
 scripts/castai-api.sh POST "/v1/cost-reports/clusters/$CASTAI_CLUSTER_ID/namespace-totalcost?startTime=$START&endTime=$END" '{"namespace":"shop"}' > results/castai-namespace-shop.json
 jq '.items[] | {namespace, totalCost}' results/castai-namespace-shop.json
 ```
-Expected: one item `"namespace": "shop"` with a `totalCost` in USD for the last 3 h (a string). The filter is a case-insensitive substring match. <!-- VERIFY: totalCost populated within 3 h of connect -->
+Expected on a cluster connected the same day: no output (the response is `{"items": [], "count": "0"}`). Checked live at 1 h, 3.5 h and 4 h after connect (3 h and 24 h windows, with and without the filter): always empty; `/cost` and `workload-costs` also stay empty and the `summary` cost fields in Step 5 stay `0`. Historical cost reports are not available within the first hours, so do not promise this live. Say what it will show (one item per namespace with `totalCost` in USD, case-insensitive substring filter) and use the point-in-time `/summary` (Step 4) for dollars today.
 
 Console equivalent: the cluster's **Cost monitoring** reports: **Cluster**, **Workloads** (with Workload Efficiency: requested vs used per workload), **Namespaces**, **Allocation Groups** and **Cost comparison** (per docs.cast.ai cost-management). `worker` and `frontend` should top the Workloads list by cost once data has accumulated. Exact menu labels vary between Enhanced and Classic console.
 

@@ -13,7 +13,7 @@
 ```text
 1. Workload Autoscaler off      remove annotation, then policy (else: fallback policy still optimizes)
 2. CAST AI autoscaler off       castai_autoscaler_policies.enabled=false, evictor off
-3. delete CAST AI nodes         kubectl delete node -l provisioner.cast.ai/managed-by=cast.ai
+3. delete CAST AI nodes         kubectl delete node; then terminate tagged instances
 4. wait instances gone + 60 s   spot/on-demand vCPU quota release lag
 5. Karpenter to 1, NodePool restored (limits back)
 -------------------------------- optional offboarding --------------------------------
@@ -23,6 +23,7 @@
 9. sweep in-cluster + AWS leftovers, rotate key
 ```
 - Never have both autoscalers on at the same time (8 + 8 vCPU quota, and CAST AI does not support it).
+- `kubectl delete node` does **not** terminate a CAST AI instance once the autoscaler is off (checked twice: instances stayed `running`). The script terminates instances tagged `castai-demo=managed` after 45 s. Without that tag sweep they are orphans that hold spot quota.
 - **Terraform ordering:** `-target=castai_eks_cluster.this` also destroys everything that depends on it, and dependents go first. The umbrella `helm_release.castai` reads the cluster token, so Helm is uninstalled just before the disconnect call. That is safe here because step 3 already removed CAST AI nodes, and the IAM role (a dependency, not a dependent) still exists for the disconnect to delete stragglers.
 - On disconnect the provider keeps Kubernetes resources (`KeepKubernetesResources=true`), hence the in-cluster sweep.
 - CAST AI documents no EC2 tag of its own. Our node configuration adds `castai-demo=managed`; every AWS sweep filters on it.
@@ -42,38 +43,54 @@
 ## Demo
 
 ### Step 1 — Turn the Workload Autoscaler off
-Annotation first, then the policy (via the switch's `terraform apply`).
+Annotation first, then the policy (the switch's `terraform apply` with `-var enable_workload_autoscaler=false`).
 ```bash
 source scripts/env.sh
 for d in $(kubectl get deploy -n shop -o name); do kubectl annotate -n shop "$d" workloads.cast.ai/configuration-; done
 kubectl delete -f manifests/12-hpa/burst-job.yaml --ignore-not-found
 kubectl delete -f workloads/hpa.yaml --ignore-not-found
 ```
-Expected: `deployment.apps/<name> annotated` for each Deployment (or `annotation ... not found` if already clean), the HPA objects deleted or not found.
+Expected: `deployment.apps/<name> annotated` for each of the 6 Deployments (also when the annotation is already gone), then `... deleted from shop namespace` lines for the job and HPA objects, or nothing if they are already gone.
 
 ### Step 2 — Switch back to Karpenter
-One script; it prints each phase.
+One script; it prints each phase. Extra args go to Terraform; without `enable_workload_autoscaler=false` the script would keep the `shop-rightsizing` policy if it exists.
 ```bash
-scripts/switch-to-karpenter.sh
+scripts/switch-to-karpenter.sh -var enable_workload_autoscaler=false
 ```
-Expected (~6–12 min):
+Expected (real run: 3 min 37 s):
 ```text
 ==> terraform apply phase=automation autoscaler_enabled=false
 ...
-Apply complete! Resources: 0 added, 2 changed, 1 destroyed.
+Plan: 0 to add, 2 to change, 0 to destroy.
+...
+Apply complete! Resources: 0 added, 2 changed, 0 destroyed.
+...
+autoscaler_enabled = false
+workload_scaling_policy_name = ""
 ==> Deleting CAST AI nodes (shop pods go Pending)
-    15s: castai-nodes=2 castai-instances=2
-    ...
-    105s: castai-nodes=0 castai-instances=0
+node "ip-10-0-0-43.ap-south-1.compute.internal" deleted
+...
+    1s: castai-nodes=0 castai-instances=3
+    48s: castai-nodes=0 castai-instances=3
+==> Instances still running; terminating tag castai-demo=managed: i-... i-... i-...
+    80s: castai-nodes=0 castai-instances=0
 ==> Sleeping 60s (quota release lag)
 ==> Scaling Karpenter to 1
 deployment "karpenter" successfully rolled out
 ==> Restoring NodePool default from karpenter-demo
-...
+nodepool.karpenter.sh/default configured
+NAME      NODECLASS   NODES   READY   AGE
+default   default     0       True    5h42m
+==> Waiting for Karpenter nodes and shop pods
+    1s: karpenter-nodes-ready=0 shop-pods=13 not-running=13
+    50s: karpenter-nodes-ready=2 shop-pods=13 not-running=0
 ==> Karpenter is the autoscaler again
-NAME   STATUS  ...  NODEPOOL  INSTANCE-TYPE  CAPACITY-TYPE  ZONE
+NAME                     ...   NODEPOOL   INSTANCE-TYPE   CAPACITY-TYPE   ZONE
+ip-10-0-19-127...        ...              t3a.large                       ap-south-1b
+ip-10-0-25-216...        ...   default    c6a.xlarge      spot            ap-south-1b
+ip-10-0-37-168...        ...   default    c6a.xlarge      spot            ap-south-1c
 ```
-`1 destroyed` is the `shop-rightsizing` policy (the script does not pass `enable_workload_autoscaler`). <!-- VERIFY: exact add/change/destroy counts -->
+`2 changed` = autoscaler policies and evictor off. If the module 11 policy still exists the plan also shows `1 to destroy`. The `terminating` line is expected: it is the orphan guard, not an error. Cross-check: `aws ec2 describe-instances --filters 'Name=tag:castai-demo,Values=managed' 'Name=instance-state-name,Values=pending,running' --query 'length(Reservations[].Instances[])'` prints `0`.
 
 ### Step 3 — Requests are back to the manifests
 Pods rescheduled during the switch; any still resized are recreated.
@@ -81,15 +98,17 @@ Pods rescheduled during the switch; any still resized are recreated.
 kubectl get pods -n shop -o custom-columns='POD:.metadata.name,CPU_REQ:.spec.containers[0].resources.requests.cpu,NODE:.spec.nodeName'
 kubectl get pods -n shop -o json | jq '[.items[] | .spec.containers[].resources.requests.cpu | if endswith("m") then (rtrimstr("m")|tonumber/1000) else tonumber end] | add'
 ```
-Expected: 300m–700m per pod and a total of `6`. If any pod still shows a rightsized value: `kubectl delete pods -n shop --all`.
+Expected: 300m–700m per pod and a total of `6.000000000000001` (float sum). If any pod still shows a rightsized value: `kubectl delete pods -n shop --all`.
 
-Optional: `scripts/measure.sh karpenter-after` and `scripts/compare.sh karpenter-baseline karpenter-after` to show the cost came back with the requests.
+Optional: `scripts/measure.sh karpenter-after` and `scripts/compare.sh karpenter-baseline karpenter-after` to show the cost came back with the requests. Real run: 2x c6a.xlarge spot, `requested vCPU (shop)` 6 → 6, `$/h workers` 0.1047 → 0.1015 (-3.1 %, spot price drift only).
 
 Stop here if the cluster keeps CAST AI in read-only mode for later sessions:
 ```bash
-terraform -chdir=terraform apply -auto-approve -input=false -var phase=readonly -var autoscaler_enabled=false
+terraform -chdir=terraform plan -input=false -out=tfplan -var phase=readonly -var autoscaler_enabled=false
+terraform -chdir=terraform apply -input=false tfplan
+rm -f terraform/tfplan
 ```
-Expected: Helm back to `tags.readonly=true` (automation components removed). <!-- VERIFY: umbrella downgrade full -> readonly removes components cleanly -->
+Expected plan: `helm_release.castai will be updated in-place` with `full = true` removed and `readonly` false → true, `Plan: 0 to add, 1 to change, 0 to destroy`, output `phase = "automation" -> "readonly"`. Only the plan was validated (the validation run had to end in `phase=automation`); after the apply check `kubectl -n castai-agent get deploy` for leftovers of the automation components.
 
 ### Step 4 (optional) — Full offboarding
 Destructive; refuses to run without the flag.
@@ -101,16 +120,17 @@ Expected: `usage: scripts/offboard.sh --yes-offboard` and `exit=1`.
 ```bash
 scripts/offboard.sh --yes-offboard
 ```
+Not executed during validation (destructive); logic and plans were checked. Every Terraform step is a saved plan (`plan -out=tfplan`, `plan -destroy -out=tfplan`) applied with `apply tfplan`, so Terraform prints `Apply complete! Resources: 0 added, 0 changed, N destroyed.` rather than `Destroy complete!`. Plan-only previews on the live state: the targeted policies/evictor/template step destroys 3; the cluster step destroys 7 (`helm_release.castai`, `castai_node_configuration.default`, `castai_node_configuration_default.this`, `castai_node_template.default`, `castai_autoscaler_policies.this`, `castai_evictor.this`, `castai_eks_cluster.this`).
 Expected (~10–15 min), sections in this order:
 ```text
 ==> Removing Workload Autoscaler annotations
 ==> terraform apply autoscaler_enabled=false enable_workload_autoscaler=false
 ==> Destroying policies, evictor, node template
-Destroy complete! Resources: N destroyed.
+Apply complete! Resources: 0 added, 0 changed, 3 destroyed.
 ==> Destroying castai_eks_cluster (disconnect, delete CAST AI nodes)
-Destroy complete! Resources: N destroyed.
+Apply complete! Resources: 0 added, 0 changed, N destroyed.
 ==> Destroying remaining Terraform resources
-Destroy complete! Resources: N destroyed.
+Apply complete! Resources: 0 added, 0 changed, N destroyed.
 ==> Sweeping in-cluster CAST AI leftovers
 ==> Recreating shop pods resized by CAST AI
 ==> AWS sweep: instances tag castai-demo=managed
@@ -124,7 +144,7 @@ helm uninstall castai -n castai-agent --no-hooks
 terraform -chdir=terraform state rm helm_release.castai
 scripts/offboard.sh --yes-offboard
 ```
-<!-- VERIFY: castai_node_template default-by-castai destroy behaviour (default template may only reset) -->
+`default-by-castai` is the cluster's default template: Terraform plans a destroy, but the API side was not exercised. If the targeted step fails on it, the script warns and the cluster step retries it.
 
 ### Step 5 — Verify nothing is left
 Kubernetes:
