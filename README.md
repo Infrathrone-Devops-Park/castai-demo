@@ -5,7 +5,8 @@ and then under CAST AI. Shows where each one saves money, and where Karpenter (+
 
 Builds on [karpenter-demo](https://github.com/Infrathrone-Devops-Park/karpenter-demo) (cluster, Karpenter, monitoring).
 
-> Status: modules are being validated on a live cluster. Fixes land here as they are verified.
+> Every command was run on a live cluster; expected output in each doc is real.
+> Prep: install CAST AI (automation) at least 24 h before the session for full Workload Autoscaler savings (see docs/00).
 
 ## Modules
 
